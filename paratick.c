@@ -5,7 +5,6 @@
 #include <linux/interrupt.h>
 #include <linux/tick.h>
 #include <linux/irq_work.h>
-#include <linux/random.h>
 #include <linux/kernel_stat.h>
 #include <linux/nmi.h>
 #include <linux/sched/nohz.h>
@@ -93,7 +92,6 @@ static inline bool local_timer_softirq_pending(void)
 	return local_softirq_pending() & BIT(TIMER_SOFTIRQ);
 }
 
-
 static ktime_t paratick_next_event(ktime_t now)
 {
         u64 basemono, next_rcu, next_tmr;
@@ -137,6 +135,7 @@ static ktime_t paratick_next_event(ktime_t now)
 	}
 }
 
+
 static void paratick_start_tick(struct paratick_data* pd, ktime_t now, ktime_t delta)
 {
 	paratick_set_timer(pd, true);
@@ -173,6 +172,7 @@ void paratick_exit_idle(void)
 	local_irq_disable();
 	timer_clear_idle();
 	paratick_set_idle(pd, false);
+	sched_clock_idle_wakeup_event();
 	if (paratick_get_timer(pd))
 		paratick_stop_tick(pd);
 	local_irq_enable();
@@ -205,7 +205,7 @@ void paratick_start_idle(void)
 }
 
 
-void paratick_account_process_ticks(ktime_t now, int user)
+static void paratick_account_process_ticks(ktime_t now, int user)
 {
 	struct task_struct* p = current;
 	ktime_t* last = &this_cpu_ptr(&data)->last_tick;
@@ -221,7 +221,7 @@ void paratick_account_process_ticks(ktime_t now, int user)
 }
 
 
-void paratick_update_process_times(ktime_t now, int user)
+static void paratick_update_process_times(ktime_t now, int user)
 {
 	paratick_account_process_ticks(now, user);
 	run_local_timers();
@@ -231,7 +231,6 @@ void paratick_update_process_times(ktime_t now, int user)
 	scheduler_tick();
 	if (IS_ENABLED(CONFIG_POSIX_TIMERS)) 
 		run_posix_cpu_timers();
-	this_cpu_add(net_rand_state.s1, rol32(jiffies, 24) + user);
 }
 
 
@@ -247,6 +246,7 @@ void paratick_irq_enter(void)
 		tick_do_update_jiffies64(now);
 		local_irq_restore(flags);
 	}
+	sched_clock_idle_wakeup_event();
 	touch_softlockup_watchdog_sched();
 }
 
@@ -257,7 +257,7 @@ void paratick_irq_exit(void)
 }
 
 
-void paratick_paratick(void)
+static void paratick_paratick(void)
 {
 	int cpu = smp_processor_id();
 	int user = user_mode(get_irq_regs());
@@ -273,7 +273,7 @@ void paratick_paratick(void)
 }
 
 
-enum hrtimer_restart paratick_sched_timer(struct hrtimer *timer)
+static enum hrtimer_restart paratick_sched_timer(struct hrtimer *timer)
 {
         struct paratick_data* pd = this_cpu_ptr(&data); 
 	int cpu = smp_processor_id();
@@ -293,7 +293,7 @@ enum hrtimer_restart paratick_sched_timer(struct hrtimer *timer)
 }
 
 
-void handle_paratick_irq(struct irq_desc* desc)
+static void handle_paratick_irq(struct irq_desc* desc)
 {
 	paratick_paratick();
 	ack_APIC_irq();
@@ -308,34 +308,44 @@ void setup_paratick_timer(void)
 	paratick_set_init(pd, true);
 }
 
+static bool module_init;
 
-int __init paratick_init(void)
+
+bool paratick_init(void)
+{
+	struct paratick_data* pd = this_cpu_ptr(&data);
+	return module_init && paratick_get_init(pd);
+}
+
+
+static struct irq_desc paratick_desc = {
+	.handle_irq = handle_paratick_irq
+};
+
+
+static int __init paratick_module_init(void)
 {
 	int cpu;
 	ktime_t now = ktime_get();
 	struct irq_desc* (*descs)[256];
-	struct irq_desc* desc = alloc_desc(PARATICK_IRQ_VECTOR,0,0,NULL,NULL);
-	desc->handle_irq = handle_paratick_irq;
 
-	for (cpu = 0; cpu < NR_CPUS; cpu++){
+	for (cpu = 0; cpu < nr_cpu_ids; cpu++){
 		descs = &per_cpu(vector_irq,cpu);
-	        (*descs)[PARATICK_IRQ_VECTOR] = desc;
+	        (*descs)[PARATICK_IRQ_VECTOR] = &paratick_desc;
 		per_cpu(data,cpu).last_tick = now;
 	}
+	module_init = true;
+	printk(KERN_INFO "Initialized paratick on %d CPUs\n",nr_cpu_ids);
 	return 0;
 }
 
 
-void __exit paratick_exit(void)
+static void __exit paratick_module_exit(void)
 {
 
 }
 
 
 
-module_init(paratick_init);
-module_exit(paratick_exit);
-
-
-
-
+module_init(paratick_module_init);
+module_exit(paratick_module_exit);
